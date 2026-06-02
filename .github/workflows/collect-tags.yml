@@ -1,25 +1,25 @@
-name: Collect Hanime Tags
+name: Full Hanime Tag Collection (One Time Run)
 
 on:
-  
   workflow_dispatch:
-    # Allow manual trigger
+    # Manual trigger only - one time run
     inputs:
-      max_videos:
-        description: 'Maximum number of videos to process'
+      request_delay:
+        description: 'Delay between requests (seconds)'
         required: false
-        default: '500'
+        default: '0.3'
         type: string
-      max_pages:
-        description: 'Maximum pages to fetch'
+      save_interval:
+        description: 'Save progress every N videos'
         required: false
         default: '50'
         type: string
 
+# Increase timeout to 6 hours (GitHub max is 6 hours, we'll use 5.5)
 jobs:
-  collect-tags:
+  collect-all-tags:
     runs-on: ubuntu-latest
-    timeout-minutes: 55  # GitHub Actions max is 6 hours, but we'll use 55 mins
+    timeout-minutes: 330  # 5.5 hours
     
     steps:
     - name: Checkout repository
@@ -51,72 +51,127 @@ jobs:
       run: |
         echo "$COOKIES_JSON" > cookies.json
         echo "✓ Created cookies.json"
+        echo "Cookie keys:"
+        cat cookies.json | jq -r '.[].name' 2>/dev/null || echo "  (binary or invalid JSON)"
     
-    - name: Download current tags.json (if exists)
+    - name: Create tags.json if not exists
       run: |
-        if [ -f "tags.json" ]; then
-          echo "✓ tags.json already exists"
-        else
-          echo "{}" > tags.json
+        if [ ! -f "tags.json" ]; then
+          echo '{"video_attributes":[],"character_relationships":[],"characteristics":[],"appearance_and_figure":[],"story_location":[],"story_plot":[],"sex_positions":[],"not_sorted":[]}' > tags.json
           echo "✓ Created empty tags.json"
+        else
+          echo "✓ tags.json already exists"
         fi
     
-    - name: Run tag collector
+    - name: Run full tag collector (unlimited pages)
       env:
-        MAX_VIDEOS: ${{ github.event.inputs.max_videos || '500' }}
-        MAX_PAGES: ${{ github.event.inputs.max_pages || '50' }}
-        REQUEST_DELAY: '0.3'
+        REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.3' }}
+        SAVE_INTERVAL: ${{ github.event.inputs.save_interval || '50' }}
       run: |
+        echo "Starting collection at $(date)"
+        echo "Request delay: $REQUEST_DELAY"
+        echo "Save interval: $SAVE_INTERVAL"
         python tagshorter.py
       continue-on-error: false
     
     - name: Check output files
       run: |
-        echo "Generated files:"
-        ls -la *.json *.txt 2>/dev/null || echo "No output files found"
+        echo "## Generated Files" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| File | Size | Description |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|------|-------------|" >> $GITHUB_STEP_SUMMARY
+        
+        for file in tags_updated.json new_tags.json new_tags.txt video_ids.txt collection_report.json collector_progress.json; do
+          if [ -f "$file" ]; then
+            size=$(du -h "$file" | cut -f1)
+            echo "| $file | $size | ✓ |" >> $GITHUB_STEP_SUMMARY
+          fi
+        done
     
     - name: Upload all results as zip
       uses: actions/upload-artifact@v4
       with:
-        name: hanime-tags-collection
+        name: hanime-full-tag-collection
         path: |
           tags_updated.json
           new_tags.json
           new_tags.txt
+          video_ids.txt
           collection_report.json
           collector_progress.json
+          tags.json
         if-no-files-found: warn
-        retention-days: 30
+        retention-days: 90
+        compression-level: 6
     
-    - name: Update tags.json (if new tags found)
+    - name: Update repository with new tags (optional)
       if: success()
       run: |
         if [ -f "tags_updated.json" ] && [ -s "tags_updated.json" ]; then
+          # Keep a backup
+          cp tags.json tags_backup_$(date +%Y%m%d_%H%M%S).json 2>/dev/null || true
           cp tags_updated.json tags.json
-          echo "✓ Updated tags.json with new tags"
+          echo "✓ Updated tags.json"
+          
+          # Update progress file
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add tags.json collector_progress.json video_ids.txt 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Auto-update tags from full collection run #${{ github.run_number }}"
+          git push || echo "No changes to push"
         fi
-    
-    - name: Commit and push updates (optional)
-      if: success() && github.event_name != 'pull_request'
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add tags.json collector_progress.json
-        git diff --staged --quiet || git commit -m "Auto-update tags from workflow run #${{ github.run_number }}"
-        git push || echo "No changes to push or push failed"
       continue-on-error: true
     
-    - name: Create summary
+    - name: Create detailed summary
       run: |
-        echo "## Tag Collection Results" >> $GITHUB_STEP_SUMMARY
+        echo "# Full Tag Collection Results" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
+        
         if [ -f "collection_report.json" ]; then
+          echo "## Statistics" >> $GITHUB_STEP_SUMMARY
           echo '```json' >> $GITHUB_STEP_SUMMARY
           cat collection_report.json >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-        else
-          echo "No collection report generated" >> $GITHUB_STEP_SUMMARY
         fi
+        
+        if [ -f "new_tags.txt" ]; then
+          tag_count=$(wc -l < new_tags.txt)
+          echo "## New Tags Found" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Found **$tag_count** new tags!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>Click to view sample (first 50)</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          head -50 new_tags.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ -f "video_ids.txt" ]; then
+          video_count=$(wc -l < video_ids.txt)
+          echo "## Video IDs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Collected **$video_count** video IDs" >> $GITHUB_STEP_SUMMARY
+        fi
+        
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Download Results" >> $GITHUB_STEP_SUMMARY
-        echo "- Download the zip artifact from this workflow run" >> $GITHUB_STEP_SUMMARY
+        echo "## Download" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Download the zip artifact from this workflow run." >> $GITHUB_STEP_SUMMARY
+
+    - name: Notify completion
+      if: success()
+      run: |
+        echo "✅ Full tag collection completed at $(date)"
+        echo "📁 Download the artifact from this workflow run"
+
+    - name: Handle timeout warning
+      if: failure()
+      run: |
+        echo "⚠️ Workflow failed or timed out"
+        echo "Check the logs for details"
+        if [ -f "collector_progress.json" ]; then
+          echo "Progress was saved - you can resume by running the workflow again"
+        fi
