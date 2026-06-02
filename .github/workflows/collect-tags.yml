@@ -1,0 +1,124 @@
+name: Collect Hanime Tags
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    # Allow manual trigger
+    inputs:
+      max_videos:
+        description: 'Maximum number of videos to process'
+        required: false
+        default: '500'
+        type: string
+      max_pages:
+        description: 'Maximum pages to fetch'
+        required: false
+        default: '50'
+        type: string
+
+jobs:
+  collect-tags:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55  # GitHub Actions max is 6 hours, but we'll use 55 mins
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Cache pip packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install curl_cffi beautifulsoup4
+    
+    - name: Create cookies.json from secret
+      env:
+        COOKIES_JSON: ${{ secrets.COOKIES }}
+      run: |
+        echo "$COOKIES_JSON" > cookies.json
+        echo "✓ Created cookies.json"
+    
+    - name: Download current tags.json (if exists)
+      run: |
+        if [ -f "tags.json" ]; then
+          echo "✓ tags.json already exists"
+        else
+          echo "{}" > tags.json
+          echo "✓ Created empty tags.json"
+        fi
+    
+    - name: Run tag collector
+      env:
+        MAX_VIDEOS: ${{ github.event.inputs.max_videos || '500' }}
+        MAX_PAGES: ${{ github.event.inputs.max_pages || '50' }}
+        REQUEST_DELAY: '0.3'
+      run: |
+        python tagshorter.py
+      continue-on-error: false
+    
+    - name: Check output files
+      run: |
+        echo "Generated files:"
+        ls -la *.json *.txt 2>/dev/null || echo "No output files found"
+    
+    - name: Upload all results as zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: hanime-tags-collection
+        path: |
+          tags_updated.json
+          new_tags.json
+          new_tags.txt
+          collection_report.json
+          collector_progress.json
+        if-no-files-found: warn
+        retention-days: 30
+    
+    - name: Update tags.json (if new tags found)
+      if: success()
+      run: |
+        if [ -f "tags_updated.json" ] && [ -s "tags_updated.json" ]; then
+          cp tags_updated.json tags.json
+          echo "✓ Updated tags.json with new tags"
+        fi
+    
+    - name: Commit and push updates (optional)
+      if: success() && github.event_name != 'pull_request'
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add tags.json collector_progress.json
+        git diff --staged --quiet || git commit -m "Auto-update tags from workflow run #${{ github.run_number }}"
+        git push || echo "No changes to push or push failed"
+      continue-on-error: true
+    
+    - name: Create summary
+      run: |
+        echo "## Tag Collection Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f "collection_report.json" ]; then
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat collection_report.json >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        else
+          echo "No collection report generated" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Download Results" >> $GITHUB_STEP_SUMMARY
+        echo "- Download the zip artifact from this workflow run" >> $GITHUB_STEP_SUMMARY
