@@ -1,8 +1,7 @@
-name: Full Hanime Tag Collection (One Time Run)
+name: Continue Hanime Tag Collection
 
 on:
   workflow_dispatch:
-    # Manual trigger only - one time run
     inputs:
       request_delay:
         description: 'Delay between requests (seconds)'
@@ -14,12 +13,16 @@ on:
         required: false
         default: '50'
         type: string
+      max_runtime_minutes:
+        description: 'Max runtime in minutes (GitHub limit ~330)'
+        required: false
+        default: '300'
+        type: string
 
-# Increase timeout to 6 hours (GitHub max is 6 hours, we'll use 5.5)
 jobs:
-  collect-all-tags:
+  continue-collection:
     runs-on: ubuntu-latest
-    timeout-minutes: 330  # 5.5 hours
+    timeout-minutes: 330  # 5.5 hours max
     
     steps:
     - name: Checkout repository
@@ -36,14 +39,14 @@ jobs:
       uses: actions/cache@v3
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-
     
     - name: Install dependencies
       run: |
         pip install --upgrade pip
-        pip install curl_cffi beautifulsoup4
+        pip install -r requirements.txt
     
     - name: Create cookies.json from secret
       env:
@@ -51,28 +54,61 @@ jobs:
       run: |
         echo "$COOKIES_JSON" > cookies.json
         echo "✓ Created cookies.json"
-        echo "Cookie keys:"
-        cat cookies.json | jq -r '.[].name' 2>/dev/null || echo "  (binary or invalid JSON)"
-    
-    - name: Create tags.json if not exists
-      run: |
-        if [ ! -f "tags.json" ]; then
-          echo '{"video_attributes":[],"character_relationships":[],"characteristics":[],"appearance_and_figure":[],"story_location":[],"story_plot":[],"sex_positions":[],"not_sorted":[]}' > tags.json
-          echo "✓ Created empty tags.json"
-        else
-          echo "✓ tags.json already exists"
+        # Verify cookies are valid
+        if ! jq empty cookies.json 2>/dev/null; then
+          echo "⚠ Warning: cookies.json is not valid JSON"
         fi
     
-    - name: Run full tag collector (unlimited pages)
+    - name: Download progress files from artifact (if exists)
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        name: hanime-collection-progress
+        path: ./
+    
+    - name: Check current progress
+      run: |
+        echo "## Current Progress" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -f "collector_progress.json" ]; then
+          echo "✅ Progress file found!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat collector_progress.json | jq '{processed_videos_count: (.processed_videos | length), all_tags_count: (.all_tags | length), new_tags_count: (.new_tags | length), video_queue_count: (.video_queue | length)}' 2>/dev/null >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Extract counts for display
+          PROCESSED=$(cat collector_progress.json | jq '.processed_videos | length')
+          TOTAL=$(cat collector_progress.json | jq '.video_queue | length')
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📊 **Progress:** $PROCESSED / $TOTAL videos processed" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠ No progress file found. Will start from beginning." >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ -f "video_ids.txt" ]; then
+          VIDEO_COUNT=$(wc -l < video_ids.txt)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📹 **Video IDs file:** $VIDEO_COUNT videos" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠ No video_ids.txt found!" >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: Run continue.py to collect remaining tags
       env:
         REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.3' }}
         SAVE_INTERVAL: ${{ github.event.inputs.save_interval || '50' }}
+        MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '300' }}
       run: |
         echo "Starting collection at $(date)"
         echo "Request delay: $REQUEST_DELAY"
         echo "Save interval: $SAVE_INTERVAL"
-        python tagshorter.py
-      continue-on-error: false
+        echo "Max runtime: $MAX_RUNTIME_MINUTES minutes"
+        
+        # Run the continue script
+        python continue.py
+      continue-on-error: true
     
     - name: Check output files
       run: |
@@ -81,97 +117,95 @@ jobs:
         echo "| File | Size | Description |" >> $GITHUB_STEP_SUMMARY
         echo "|------|------|-------------|" >> $GITHUB_STEP_SUMMARY
         
-        for file in tags_updated.json new_tags.json new_tags.txt video_ids.txt collection_report.json collector_progress.json; do
+        for file in tags_updated.json new_tags.json new_tags.txt collection_report.json collector_progress.json; do
           if [ -f "$file" ]; then
             size=$(du -h "$file" | cut -f1)
             echo "| $file | $size | ✓ |" >> $GITHUB_STEP_SUMMARY
           fi
         done
     
-    - name: Upload all results as zip
-      uses: actions/upload-artifact@v4
-      with:
-        name: hanime-full-tag-collection
-        path: |
-          tags_updated.json
-          new_tags.json
-          new_tags.txt
-          video_ids.txt
-          collection_report.json
-          collector_progress.json
-          tags.json
-        if-no-files-found: warn
-        retention-days: 90
-        compression-level: 6
-    
-    - name: Update repository with new tags (optional)
-      if: success()
+    - name: Show collection statistics
       run: |
-        if [ -f "tags_updated.json" ] && [ -s "tags_updated.json" ]; then
-          # Keep a backup
-          cp tags.json tags_backup_$(date +%Y%m%d_%H%M%S).json 2>/dev/null || true
-          cp tags_updated.json tags.json
-          echo "✓ Updated tags.json"
-          
-          # Update progress file
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add tags.json collector_progress.json video_ids.txt 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "Auto-update tags from full collection run #${{ github.run_number }}"
-          git push || echo "No changes to push"
-        fi
-      continue-on-error: true
-    
-    - name: Create detailed summary
-      run: |
-        echo "# Full Tag Collection Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Collection Statistics" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         
         if [ -f "collection_report.json" ]; then
-          echo "## Statistics" >> $GITHUB_STEP_SUMMARY
           echo '```json' >> $GITHUB_STEP_SUMMARY
           cat collection_report.json >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
         fi
         
         if [ -f "new_tags.txt" ]; then
-          tag_count=$(wc -l < new_tags.txt)
-          echo "## New Tags Found" >> $GITHUB_STEP_SUMMARY
+          NEW_TAG_COUNT=$(wc -l < new_tags.txt)
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Found **$tag_count** new tags!" >> $GITHUB_STEP_SUMMARY
+          echo "**New tags found:** $NEW_TAG_COUNT" >> $GITHUB_STEP_SUMMARY
+          
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "<details>" >> $GITHUB_STEP_SUMMARY
-          echo "<summary>Click to view sample (first 50)</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>Sample new tags (first 50)</summary>" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           head -50 new_tags.txt >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "</details>" >> $GITHUB_STEP_SUMMARY
         fi
-        
-        if [ -f "video_ids.txt" ]; then
-          video_count=$(wc -l < video_ids.txt)
-          echo "## Video IDs" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Collected **$video_count** video IDs" >> $GITHUB_STEP_SUMMARY
-        fi
-        
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "## Download" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "Download the zip artifact from this workflow run." >> $GITHUB_STEP_SUMMARY
-
-    - name: Notify completion
+    
+    - name: Upload progress and results as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: hanime-collection-progress
+        path: |
+          collector_progress.json
+          tags_updated.json
+          new_tags.json
+          new_tags.txt
+          collection_report.json
+          video_ids.txt
+          tags.json
+        if-no-files-found: warn
+        retention-days: 90
+        compression-level: 6
+    
+    - name: Update repository with latest tags (optional)
       if: success()
       run: |
-        echo "✅ Full tag collection completed at $(date)"
-        echo "📁 Download the artifact from this workflow run"
-
-    - name: Handle timeout warning
-      if: failure()
-      run: |
-        echo "⚠️ Workflow failed or timed out"
-        echo "Check the logs for details"
-        if [ -f "collector_progress.json" ]; then
-          echo "Progress was saved - you can resume by running the workflow again"
+        if [ -f "tags_updated.json" ] && [ -s "tags_updated.json" ]; then
+          cp tags_updated.json tags.json
+          echo "✓ Updated tags.json"
+          
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add tags.json collector_progress.json video_ids.txt 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Auto-update tags from workflow run #${{ github.run_number }}"
+          git push || echo "No changes to push"
         fi
+      continue-on-error: true
+    
+    - name: Check if more videos remain
+      id: check_remaining
+      run: |
+        if [ -f "collector_progress.json" ]; then
+          PROCESSED=$(cat collector_progress.json | jq '.processed_videos | length')
+          TOTAL=$(cat collector_progress.json | jq '.video_queue | length')
+          REMAINING=$((TOTAL - PROCESSED))
+          echo "remaining=$REMAINING" >> $GITHUB_OUTPUT
+          
+          if [ $REMAINING -gt 0 ]; then
+            echo "## ⏰ More videos remain!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**$REMAINING videos still need to be processed.**" >> $GITHUB_STEP_SUMMARY
+            echo "Run this workflow again to continue." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ✅ Collection Complete!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "All $TOTAL videos have been processed!" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
+    
+    - name: Summary footer
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📁 **Download the artifact** from this workflow run to get all files." >> $GITHUB_STEP_SUMMARY
