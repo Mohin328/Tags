@@ -1,13 +1,12 @@
-name: Full Hanime Tag Collection (One Time Run)
+name: Full Hanime Tag Collection
 
 on:
   workflow_dispatch:
-    # Manual trigger only - one time run
     inputs:
       request_delay:
         description: 'Delay between requests (seconds)'
         required: false
-        default: '0.3'
+        default: '0.5'
         type: string
       save_interval:
         description: 'Save progress every N videos'
@@ -15,11 +14,10 @@ on:
         default: '50'
         type: string
 
-# Increase timeout to 6 hours (GitHub max is 6 hours, we'll use 5.5)
 jobs:
   collect-all-tags:
     runs-on: ubuntu-latest
-    timeout-minutes: 330  # 5.5 hours
+    timeout-minutes: 330
     
     steps:
     - name: Checkout repository
@@ -51,8 +49,11 @@ jobs:
       run: |
         echo "$COOKIES_JSON" > cookies.json
         echo "✓ Created cookies.json"
-        echo "Cookie keys:"
-        cat cookies.json | jq -r '.[].name' 2>/dev/null || echo "  (binary or invalid JSON)"
+        # Verify cookies are valid JSON
+        if ! jq empty cookies.json 2>/dev/null; then
+          echo "⚠ Warning: cookies.json is not valid JSON"
+          cat cookies.json
+        fi
     
     - name: Create tags.json if not exists
       run: |
@@ -63,15 +64,27 @@ jobs:
           echo "✓ tags.json already exists"
         fi
     
-    - name: Run full tag collector (unlimited pages)
+    - name: Run full tag collector with retries
       env:
-        REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.3' }}
+        REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.5' }}
         SAVE_INTERVAL: ${{ github.event.inputs.save_interval || '50' }}
       run: |
         echo "Starting collection at $(date)"
         echo "Request delay: $REQUEST_DELAY"
         echo "Save interval: $SAVE_INTERVAL"
-        python tagshorter.py
+        
+        # Run with retry wrapper
+        max_retries=3
+        retry_count=0
+        while [ $retry_count -lt $max_retries ]; do
+          if python tagshorter.py; then
+            exit 0
+          fi
+          retry_count=$((retry_count + 1))
+          echo "Attempt $retry_count failed. Retrying in 60 seconds..."
+          sleep 60
+        done
+        exit 1
       continue-on-error: false
     
     - name: Check output files
@@ -104,27 +117,12 @@ jobs:
         retention-days: 90
         compression-level: 6
     
-    - name: Update repository with new tags (optional)
-      if: success()
-      run: |
-        if [ -f "tags_updated.json" ] && [ -s "tags_updated.json" ]; then
-          # Keep a backup
-          cp tags.json tags_backup_$(date +%Y%m%d_%H%M%S).json 2>/dev/null || true
-          cp tags_updated.json tags.json
-          echo "✓ Updated tags.json"
-          
-          # Update progress file
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add tags.json collector_progress.json video_ids.txt 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "Auto-update tags from full collection run #${{ github.run_number }}"
-          git push || echo "No changes to push"
-        fi
-      continue-on-error: true
-    
     - name: Create detailed summary
+      if: always()
       run: |
         echo "# Full Tag Collection Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Run completed at:** $(date)" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         
         if [ -f "collection_report.json" ]; then
@@ -160,18 +158,3 @@ jobs:
         echo "## Download" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "Download the zip artifact from this workflow run." >> $GITHUB_STEP_SUMMARY
-
-    - name: Notify completion
-      if: success()
-      run: |
-        echo "✅ Full tag collection completed at $(date)"
-        echo "📁 Download the artifact from this workflow run"
-
-    - name: Handle timeout warning
-      if: failure()
-      run: |
-        echo "⚠️ Workflow failed or timed out"
-        echo "Check the logs for details"
-        if [ -f "collector_progress.json" ]; then
-          echo "Progress was saved - you can resume by running the workflow again"
-        fi

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hanime Tag Collector - Full collection mode (unlimited pages)
+Hanime Tag Collector - Full collection mode with anti-blocking
 """
 
 from curl_cffi import requests
@@ -10,6 +10,7 @@ import json
 import re
 import os
 import sys
+import random
 from collections import Counter
 from typing import Set, List, Dict, Optional
 from datetime import datetime
@@ -19,21 +20,38 @@ class HanimeTagCollector:
                  tags_json_file: str = "tags.json", progress_file: str = "collector_progress.json"):
         self.base_url = base_url
         self.progress_file = progress_file
-        self.session = requests.Session(impersonate="chrome120")
+        
+        # Random impersonation to avoid detection
+        impersonates = ["chrome120", "chrome119", "chrome118", "safari15_5", "edge101"]
+        self.session = requests.Session(impersonate=random.choice(impersonates))
+        
+        # Rotate user agents
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        ]
         
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': random.choice(user_agents),
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
             'Referer': base_url,
         })
         
         # Load cookies
         if os.path.exists(cookies_file):
             self.load_cookies(cookies_file)
+        else:
+            print("⚠ No cookies file found")
         
         # Load existing tags
         self.existing_tags = self.load_existing_tags(tags_json_file)
@@ -43,6 +61,7 @@ class HanimeTagCollector:
         
         # Statistics
         self.start_time = None
+        self.request_count = 0
         
     def load_cookies(self, cookies_file: str):
         try:
@@ -170,6 +189,35 @@ class HanimeTagCollector:
         
         return tags
     
+    def get_with_retry(self, url: str, max_retries: int = 3) -> Optional[requests.Response]:
+        """Make request with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                # Add random delay between retries
+                if attempt > 0:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                
+                resp = self.session.get(url, timeout=20)
+                self.request_count += 1
+                
+                if resp.status_code == 200:
+                    return resp
+                elif resp.status_code == 403:
+                    # Rotate impersonation on 403
+                    impersonates = ["chrome120", "chrome119", "safari15_5"]
+                    self.session = requests.Session(impersonate=random.choice(impersonates))
+                    print(f"  Rotated impersonation due to 403")
+                    continue
+                else:
+                    return None
+                    
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"  Failed after {max_retries} attempts: {e}")
+                continue
+        
+        return None
+    
     def get_all_video_ids_unlimited(self) -> List[str]:
         """Get ALL video IDs from ALL search pages (unlimited)"""
         video_ids = []
@@ -187,10 +235,10 @@ class HanimeTagCollector:
                     url = f"{self.base_url}/search?page={page}"
                 
                 print(f"  Fetching page {page}...", end=" ")
-                resp = self.session.get(url, timeout=15)
+                resp = self.get_with_retry(url)
                 
-                if resp.status_code != 200:
-                    print(f"Failed (status {resp.status_code})")
+                if not resp or resp.status_code != 200:
+                    print(f"Failed (status {resp.status_code if resp else 'None'})")
                     consecutive_empty += 1
                     page += 1
                     continue
@@ -221,7 +269,7 @@ class HanimeTagCollector:
                     print(f"  Less than full page ({len(links)} videos), checking next page...")
                 
                 page += 1
-                time.sleep(0.3)  # Be respectful
+                time.sleep(random.uniform(0.5, 1.0))  # Random delay
                 
                 # Safety limit - prevent infinite loop (max 500 pages ~ 12,000 videos)
                 if page > 500:
@@ -232,7 +280,7 @@ class HanimeTagCollector:
                 print(f"Error: {e}")
                 consecutive_empty += 1
                 page += 1
-                time.sleep(1)
+                time.sleep(2)
         
         print(f"\n✓ TOTAL video IDs collected: {len(video_ids)}")
         return video_ids
@@ -244,9 +292,9 @@ class HanimeTagCollector:
         video_url = f"{self.base_url}/watch?v={video_id}"
         
         try:
-            resp = self.session.get(video_url, timeout=15)
+            resp = self.get_with_retry(video_url)
             
-            if resp.status_code != 200:
+            if not resp or resp.status_code != 200:
                 return None
             
             tags = self.extract_tags_from_video(resp.text)
@@ -366,16 +414,13 @@ class HanimeTagCollector:
         print(f"Request delay: {delay}s")
         print(f"Save progress every: {save_interval} videos")
         
-        # Test connection
-        try:
-            resp = self.session.get(self.base_url, timeout=15)
-            if resp.status_code != 200:
-                print(f"✗ Cannot access website (status: {resp.status_code})")
-                return False
-            print("✓ Connected to website")
-        except Exception as e:
-            print(f"✗ Cannot connect: {e}")
+        # Test connection with retry
+        print("Testing connection...")
+        resp = self.get_with_retry(self.base_url, max_retries=5)
+        if not resp or resp.status_code != 200:
+            print(f"✗ Cannot access website after retries")
             return False
+        print("✓ Connected to website")
         
         # Get ALL video IDs (unlimited)
         if not self.video_queue:
@@ -430,7 +475,8 @@ class HanimeTagCollector:
                 self.save_progress()
                 print(f"  💾 Progress saved at {processed_count}/{len(self.video_queue)}")
             
-            time.sleep(delay)
+            # Random delay to avoid detection
+            time.sleep(delay + random.uniform(0, 0.2))
             
             # Check runtime - GitHub Actions has 6 hour limit, stop at 5.5 hours
             if self.start_time and (time.time() - self.start_time) > 5.5 * 3600:
@@ -450,6 +496,7 @@ class HanimeTagCollector:
         print(f"  Videos remaining: {len(self.video_queue) - len(self.processed_videos)}")
         print(f"  Total unique tags: {len(self.all_tags)}")
         print(f"  New tags found: {len(self.new_tags)}")
+        print(f"  Total requests made: {self.request_count}")
         
         if self.new_tags:
             print(f"\n  Top 30 new tags (by frequency):")
@@ -467,7 +514,7 @@ class HanimeTagCollector:
 
 def main():
     # Configuration from environment variables (for GitHub Actions)
-    delay = float(os.environ.get('REQUEST_DELAY', '0.3'))
+    delay = float(os.environ.get('REQUEST_DELAY', '0.5'))  # Increased default delay
     save_interval = int(os.environ.get('SAVE_INTERVAL', '50'))
     
     print(f"\nConfiguration:")
