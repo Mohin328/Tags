@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hanime Tag Collector - GitHub Actions compatible version
+Hanime Tag Collector - Full collection mode (unlimited pages)
 """
 
 from curl_cffi import requests
@@ -31,7 +31,7 @@ class HanimeTagCollector:
             'Referer': base_url,
         })
         
-        # Load cookies from GitHub secret
+        # Load cookies
         if os.path.exists(cookies_file):
             self.load_cookies(cookies_file)
         
@@ -40,6 +40,9 @@ class HanimeTagCollector:
         
         # Load or initialize collections
         self.load_progress()
+        
+        # Statistics
+        self.start_time = None
         
     def load_cookies(self, cookies_file: str):
         try:
@@ -116,7 +119,8 @@ class HanimeTagCollector:
                 "tag_counter": dict(self.tag_counter),
                 "new_tags": list(self.new_tags),
                 "video_queue": self.video_queue,
-                "timestamp": time.time()
+                "timestamp": time.time(),
+                "last_update": datetime.now().isoformat()
             }
             with open(self.progress_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -166,44 +170,71 @@ class HanimeTagCollector:
         
         return tags
     
-    def get_all_video_ids(self, max_pages: int = 50) -> List[str]:
-        """Get video IDs from search pages"""
+    def get_all_video_ids_unlimited(self) -> List[str]:
+        """Get ALL video IDs from ALL search pages (unlimited)"""
         video_ids = []
+        page = 1
+        consecutive_empty = 0
         
-        print(f"\n📹 Fetching video IDs (max {max_pages} pages)...")
+        print(f"\n📹 Fetching ALL video IDs from ALL pages...")
+        print("   This may take a while...")
         
-        for page in range(1, max_pages + 1):
+        while consecutive_empty < 3:  # Stop after 3 consecutive empty pages
             try:
                 if page == 1:
                     url = f"{self.base_url}/search"
                 else:
                     url = f"{self.base_url}/search?page={page}"
                 
+                print(f"  Fetching page {page}...", end=" ")
                 resp = self.session.get(url, timeout=15)
                 
                 if resp.status_code != 200:
-                    break
+                    print(f"Failed (status {resp.status_code})")
+                    consecutive_empty += 1
+                    page += 1
+                    continue
                 
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 links = soup.find_all('a', href=re.compile(r'watch\?v=\d+'))
                 
                 if not links:
-                    break
+                    print("No videos found")
+                    consecutive_empty += 1
+                    page += 1
+                    continue
+                
+                consecutive_empty = 0
+                new_count = 0
                 
                 for link in links:
                     href = link.get('href')
                     match = re.search(r'v=(\d+)', href)
                     if match and match.group(1) not in video_ids:
                         video_ids.append(match.group(1))
+                        new_count += 1
                 
-                print(f"  Page {page}: Found {len(video_ids)} total videos")
-                time.sleep(0.3)
+                print(f"Found {new_count} new videos (Total: {len(video_ids)})")
+                
+                # If we got less than a full page, we might be near the end
+                if len(links) < 24:
+                    print(f"  Less than full page ({len(links)} videos), checking next page...")
+                
+                page += 1
+                time.sleep(0.3)  # Be respectful
+                
+                # Safety limit - prevent infinite loop (max 500 pages ~ 12,000 videos)
+                if page > 500:
+                    print(f"\n  Reached page limit (500 pages). Stopping.")
+                    break
                 
             except Exception as e:
-                print(f"  Error on page {page}: {e}")
-                break
+                print(f"Error: {e}")
+                consecutive_empty += 1
+                page += 1
+                time.sleep(1)
         
-        print(f"\n✓ Total video IDs found: {len(video_ids)}")
+        print(f"\n✓ TOTAL video IDs collected: {len(video_ids)}")
         return video_ids
     
     def collect_tags_from_video(self, video_id: str, existing_keys: Set[str]) -> Optional[List[str]]:
@@ -237,8 +268,25 @@ class HanimeTagCollector:
         except Exception as e:
             return None
     
+    def print_progress(self, processed: int, total: int, elapsed_minutes: float):
+        """Print progress statistics"""
+        if processed == 0:
+            return
+        
+        percent = (processed / total * 100) if total > 0 else 0
+        tags_per_video = len(self.all_tags) / processed
+        new_per_video = len(self.new_tags) / processed
+        videos_per_minute = processed / elapsed_minutes if elapsed_minutes > 0 else 0
+        remaining = total - processed
+        eta_minutes = remaining / videos_per_minute if videos_per_minute > 0 else 0
+        
+        print(f"\n📊 Progress: {processed}/{total} videos ({percent:.1f}%)")
+        print(f"   Tags: {len(self.all_tags)} total, {len(self.new_tags)} new")
+        print(f"   Speed: {videos_per_minute:.1f} videos/min")
+        print(f"   ETA: {eta_minutes:.0f} min ({eta_minutes/60:.1f} hours)")
+    
     def create_output_files(self):
-        """Create all output files for GitHub Actions"""
+        """Create all output files"""
         
         # 1. Create tags_updated.json (complete merged file)
         final_tags = {category: list(items) for category, items in self.existing_tags.items()}
@@ -260,7 +308,7 @@ class HanimeTagCollector:
             json.dump(final_tags, f, ensure_ascii=False, indent=2)
         print("✓ Created tags_updated.json")
         
-        # 2. Create new_tags.json (only new tags, same format as not_sorted)
+        # 2. Create new_tags.json (only new tags)
         new_tags_list = []
         for tag in sorted(self.new_tags):
             new_tags_list.append({
@@ -276,31 +324,47 @@ class HanimeTagCollector:
             json.dump(new_tags_list, f, ensure_ascii=False, indent=2)
         print(f"✓ Created new_tags.json with {len(new_tags_list)} new tags")
         
-        # 3. Create new_tags.txt (only the tag strings, one per line)
+        # 3. Create new_tags.txt (tag strings only)
         with open("new_tags.txt", "w", encoding='utf-8') as f:
             for tag in sorted(self.new_tags):
                 f.write(f"{tag}\n")
         print(f"✓ Created new_tags.txt with {len(self.new_tags)} tags")
         
-        # 4. Create collection report
+        # 4. Create video_ids.txt (all video IDs collected)
+        if self.video_queue:
+            with open("video_ids.txt", "w", encoding='utf-8') as f:
+                for vid in self.video_queue:
+                    f.write(f"{vid}\n")
+            print(f"✓ Created video_ids.txt with {len(self.video_queue)} video IDs")
+        
+        # 5. Create collection report
+        elapsed_hours = (time.time() - self.start_time) / 3600 if self.start_time else 0
+        
         report = {
             "timestamp": datetime.now().isoformat(),
+            "runtime_hours": elapsed_hours,
+            "total_videos_in_queue": len(self.video_queue),
             "videos_processed": len(self.processed_videos),
+            "videos_remaining": len(self.video_queue) - len(self.processed_videos),
             "total_unique_tags": len(self.all_tags),
             "new_tags_found": len(self.new_tags),
-            "new_tags_list": sorted(list(self.new_tags))
+            "new_tags_list": sorted(list(self.new_tags)),
+            "tag_frequency_top50": dict(self.tag_counter.most_common(50))
         }
         
         with open("collection_report.json", "w", encoding='utf-8') as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
         print("✓ Created collection_report.json")
     
-    def collect_all_tags(self, max_videos: Optional[int] = 500, max_pages: int = 50, delay: float = 0.3):
-        """Main collection method for GitHub Actions (limited runtime)"""
+    def collect_all_tags_unlimited(self, delay: float = 0.3, save_interval: int = 50):
+        """Collect tags from ALL videos (unlimited)"""
         
         print(f"\n{'='*60}")
-        print(f"HANIME TAG COLLECTOR - GITHUB ACTIONS MODE")
+        print(f"HANIME TAG COLLECTOR - FULL COLLECTION MODE")
         print(f"{'='*60}")
+        print(f"Target: {self.base_url}")
+        print(f"Request delay: {delay}s")
+        print(f"Save progress every: {save_interval} videos")
         
         # Test connection
         try:
@@ -313,33 +377,40 @@ class HanimeTagCollector:
             print(f"✗ Cannot connect: {e}")
             return False
         
-        # Get or load video queue
+        # Get ALL video IDs (unlimited)
         if not self.video_queue:
-            self.video_queue = self.get_all_video_ids(max_pages=max_pages)
+            self.video_queue = self.get_all_video_ids_unlimited()
             self.save_progress()
         
-        # Filter out processed videos
-        remaining_videos = [vid for vid in self.video_queue if vid not in self.processed_videos]
+        if not self.video_queue:
+            print("✗ No video IDs found!")
+            return False
         
-        if max_videos:
-            remaining_videos = remaining_videos[:max_videos]
+        # Filter out already processed videos
+        remaining_videos = [vid for vid in self.video_queue if vid not in self.processed_videos]
         
         if not remaining_videos:
             print("\n✓ All videos already processed!")
             self.create_output_files()
             return True
         
-        print(f"\n📊 Processing {len(remaining_videos)} new videos...")
+        print(f"\n📊 Processing Summary:")
+        print(f"  Total videos in queue: {len(self.video_queue)}")
+        print(f"  Already processed: {len(self.processed_videos)}")
+        print(f"  Remaining to process: {len(remaining_videos)}")
         
         # Get existing keys for deduplication
         existing_keys = self.get_existing_search_keys()
-        print(f"  Existing tags: {len(existing_keys)}")
+        print(f"  Existing tags in database: {len(existing_keys)}")
         
-        # Process videos
-        print("\n🏷️ Collecting tags...")
+        # Start collection
+        print("\n🏷️ Collecting tags from videos...")
+        print("   This will take several hours...")
         print("-" * 60)
         
+        self.start_time = time.time()
         processed_count = len(self.processed_videos)
+        last_progress_print = 0
         
         for i, video_id in enumerate(remaining_videos, 1):
             tags = self.collect_tags_from_video(video_id, existing_keys)
@@ -347,33 +418,44 @@ class HanimeTagCollector:
             if tags is not None:
                 processed_count += 1
                 
-                # Print progress
-                if processed_count % 20 == 0 or i == len(remaining_videos):
-                    print(f"  Progress: {processed_count}/{len(self.video_queue)} videos")
-                    print(f"  Tags: {len(self.all_tags)} total, {len(self.new_tags)} new")
+                # Print progress every 50 videos
+                if processed_count - last_progress_print >= 50:
+                    elapsed_minutes = (time.time() - self.start_time) / 60
+                    self.print_progress(processed_count, len(self.video_queue), elapsed_minutes)
+                    last_progress_print = processed_count
                     print("-" * 60)
             
-            # Save progress every 50 videos
-            if i % 50 == 0:
+            # Save progress at intervals
+            if i % save_interval == 0:
                 self.save_progress()
+                print(f"  💾 Progress saved at {processed_count}/{len(self.video_queue)}")
             
             time.sleep(delay)
+            
+            # Check runtime - GitHub Actions has 6 hour limit, stop at 5.5 hours
+            if self.start_time and (time.time() - self.start_time) > 5.5 * 3600:
+                print("\n⚠ Approaching 5.5 hour limit. Saving progress and stopping...")
+                break
         
         # Save final progress
         self.save_progress()
         
-        # Print statistics
+        # Print final statistics
+        elapsed_hours = (time.time() - self.start_time) / 3600
         print("\n" + "=" * 60)
-        print("📊 COLLECTION STATISTICS")
+        print("📊 FINAL COLLECTION STATISTICS")
         print("=" * 60)
+        print(f"  Runtime: {elapsed_hours:.2f} hours")
         print(f"  Videos processed: {len(self.processed_videos)}")
+        print(f"  Videos remaining: {len(self.video_queue) - len(self.processed_videos)}")
         print(f"  Total unique tags: {len(self.all_tags)}")
         print(f"  New tags found: {len(self.new_tags)}")
         
         if self.new_tags:
-            print(f"\n  Sample new tags:")
-            for tag in sorted(list(self.new_tags))[:20]:
-                count = self.tag_counter.get(tag, 0)
+            print(f"\n  Top 30 new tags (by frequency):")
+            sorted_new_tags = sorted([(tag, self.tag_counter.get(tag, 0)) for tag in self.new_tags], 
+                                    key=lambda x: x[1], reverse=True)
+            for tag, count in sorted_new_tags[:30]:
                 print(f"    - {tag} (appears {count} times)")
         
         # Create output files
@@ -384,15 +466,13 @@ class HanimeTagCollector:
 
 
 def main():
-    # GitHub Actions environment variables
-    max_videos = int(os.environ.get('MAX_VIDEOS', 500))
-    max_pages = int(os.environ.get('MAX_PAGES', 50))
-    delay = float(os.environ.get('REQUEST_DELAY', 0.3))
+    # Configuration from environment variables (for GitHub Actions)
+    delay = float(os.environ.get('REQUEST_DELAY', '0.3'))
+    save_interval = int(os.environ.get('SAVE_INTERVAL', '50'))
     
-    print(f"\nConfiguration from environment:")
-    print(f"  MAX_VIDEOS: {max_videos}")
-    print(f"  MAX_PAGES: {max_pages}")
+    print(f"\nConfiguration:")
     print(f"  REQUEST_DELAY: {delay}s")
+    print(f"  SAVE_INTERVAL: {save_interval} videos")
     
     # Check for cookies
     if not os.path.exists("cookies.json"):
@@ -403,6 +483,19 @@ def main():
     # Check for tags.json
     if not os.path.exists("tags.json"):
         print("⚠ tags.json not found, starting fresh")
+        # Create empty tags.json
+        empty_tags = {
+            "video_attributes": [],
+            "character_relationships": [],
+            "characteristics": [],
+            "appearance_and_figure": [],
+            "story_location": [],
+            "story_plot": [],
+            "sex_positions": [],
+            "not_sorted": []
+        }
+        with open("tags.json", "w", encoding='utf-8') as f:
+            json.dump(empty_tags, f, ensure_ascii=False, indent=2)
     
     # Run collector
     collector = HanimeTagCollector(
@@ -411,10 +504,9 @@ def main():
         tags_json_file="tags.json"
     )
     
-    success = collector.collect_all_tags(
-        max_videos=max_videos,
-        max_pages=max_pages,
-        delay=delay
+    success = collector.collect_all_tags_unlimited(
+        delay=delay,
+        save_interval=save_interval
     )
     
     if success:
