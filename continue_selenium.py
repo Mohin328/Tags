@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Continue Tag Collection - Using Selenium with Chrome (Harder to block)
+Continue Tag Collection - Using Selenium with Chrome (Fixed for GitHub Actions)
 """
 
 from selenium import webdriver
@@ -8,6 +8,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from bs4 import BeautifulSoup
 import time
 import json
@@ -32,23 +33,31 @@ class SeleniumCollector:
         """Initialize Chrome driver with anti-detection options"""
         chrome_options = Options()
         
+        # Chrome binary location for GitHub Actions
+        chrome_options.binary_location = "/usr/bin/google-chrome"
+        
         # Anti-detection arguments
-        chrome_options.add_argument('--headless=new')  # Headless mode for GitHub Actions
+        chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
-        # Additional anti-detection
-        chrome_options.add_argument('--disable-web-security')
-        chrome_options.add_argument('--disable-features=VizDisplayCompositor')
-        chrome_options.add_argument('--enable-features=NetworkService,NetworkServiceInProcess')
+        # Random user agent
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        ]
+        chrome_options.add_argument(f'--user-agent={random.choice(user_agents)}')
         
-        self.driver = webdriver.Chrome(options=chrome_options)
+        # Set ChromeDriver path
+        service = Service(executable_path="/usr/local/bin/chromedriver")
+        
+        self.driver = webdriver.Chrome(service=service, options=chrome_options)
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         print("✓ Chrome driver initialized")
@@ -58,14 +67,13 @@ class SeleniumCollector:
         if os.path.exists("cookies.json"):
             # First navigate to domain to set cookies
             self.driver.get(self.base_url)
-            time.sleep(2)
+            time.sleep(3)
             
             with open("cookies.json", 'r') as f:
                 cookies = json.load(f)
             
             for cookie in cookies:
                 try:
-                    # Convert cookie format for selenium
                     cookie_dict = {
                         'name': cookie['name'],
                         'value': cookie['value'],
@@ -79,7 +87,7 @@ class SeleniumCollector:
                     pass
             
             self.driver.refresh()
-            time.sleep(2)
+            time.sleep(3)
             print(f"✓ Loaded {len(cookies)} cookies")
     
     def load_existing_keys(self):
@@ -127,7 +135,7 @@ class SeleniumCollector:
         return tag
     
     def extract_tags_from_page(self):
-        """Extract tags from current page using BeautifulSoup"""
+        """Extract tags from current page"""
         html = self.driver.page_source
         soup = BeautifulSoup(html, 'html.parser')
         tags = []
@@ -146,11 +154,10 @@ class SeleniumCollector:
         url = f"{self.base_url}/watch?v={video_id}"
         
         try:
-            # Navigate to video page
             self.driver.get(url)
-            time.sleep(random.uniform(1, 2))  # Random delay
+            time.sleep(random.uniform(1, 2))
             
-            # Wait for tags to load
+            # Wait for tags
             try:
                 WebDriverWait(self.driver, 10).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, ".single-video-tag"))
@@ -158,7 +165,6 @@ class SeleniumCollector:
             except:
                 pass
             
-            # Extract tags
             tags = self.extract_tags_from_page()
             
             self.processed_videos.add(video_id)
@@ -217,7 +223,6 @@ class SeleniumCollector:
             
             time.sleep(delay)
             
-            # Stop at 5.5 hours
             if (time.time() - start) > 5.5 * 3600:
                 print("\n⚠ Time limit reached, saving...")
                 break
