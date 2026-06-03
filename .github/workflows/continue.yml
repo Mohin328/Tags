@@ -1,4 +1,4 @@
-name: Continue Tag Collection
+name: Continue Tag Collection with Selenium
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       delay:
         description: 'Delay between requests (seconds)'
         required: false
-        default: '0.5'
+        default: '1.0'
       save_interval:
         description: 'Save progress every N videos'
         required: false
@@ -25,11 +25,16 @@ jobs:
       with:
         python-version: '3.11'
     
+    - name: Install Chrome
+      run: |
+        sudo apt update
+        sudo apt install -y chromium-browser chromium-chromedriver
+    
     - name: Install dependencies
       run: |
-        pip install curl_cffi beautifulsoup4
+        pip install selenium beautifulsoup4
     
-    - name: Create cookies.json
+    - name: Create cookies.json from secret
       env:
         COOKIES_JSON: ${{ secrets.COOKIES }}
       run: echo "$COOKIES_JSON" > cookies.json
@@ -38,19 +43,42 @@ jobs:
       uses: actions/download-artifact@v4
       continue-on-error: true
       with:
-        name: tag-progress
+        name: tag-progress-selenium
         path: ./
     
-    - name: Run collector
+    - name: Show current progress
       run: |
-        python continue.py
+        if [ -f "collector_progress.json" ]; then
+          PROCESSED=$(python -c "import json; d=open('collector_progress.json').read(); print(len(json.loads(d).get('processed_videos', [])))")
+          TOTAL=$(python -c "import json; d=open('collector_progress.json').read(); print(len(json.loads(d).get('video_queue', [])))")
+          echo "📊 Progress: $PROCESSED / $TOTAL videos"
+          echo "PROCESSED=$PROCESSED" >> $GITHUB_ENV
+          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+        fi
+    
+    - name: Run Selenium collector
+      env:
+        CHROME_BIN: /usr/bin/chromium-browser
+        CHROMEDRIVER_PATH: /usr/bin/chromedriver
+      run: |
+        echo "Starting at $(date)"
+        python continue_selenium.py
     
     - name: Upload results
       uses: actions/upload-artifact@v4
       with:
-        name: tag-progress
+        name: tag-progress-selenium
         path: |
           collector_progress.json
           tags_updated.json
           new_tags.txt
         retention-days: 90
+    
+    - name: Show summary
+      if: always()
+      run: |
+        echo "## Collection Results" >> $GITHUB_STEP_SUMMARY
+        if [ -f "new_tags.txt" ]; then
+          COUNT=$(wc -l < new_tags.txt)
+          echo "**New tags found:** $COUNT" >> $GITHUB_STEP_SUMMARY
+        fi
