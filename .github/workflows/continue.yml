@@ -1,41 +1,38 @@
-name: Continue Tag Collection
+name: Continue Tag Collection with Selenium
 
 on:
   workflow_dispatch:
     inputs:
-      request_delay:
+      delay:
         description: 'Delay between requests (seconds)'
         required: false
-        default: '0.3'
-        type: string
+        default: '1.0'
       save_interval:
         description: 'Save progress every N videos'
         required: false
         default: '50'
-        type: string
-      max_videos:
-        description: 'Max videos this run (0 = unlimited)'
-        required: false
-        default: '0'
-        type: string
 
 jobs:
   continue:
     runs-on: ubuntu-latest
-    timeout-minutes: 330  # 5.5 hours
+    timeout-minutes: 330
     
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
     
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
     
+    - name: Install Chrome
+      run: |
+        sudo apt update
+        sudo apt install -y chromium-browser chromium-chromedriver
+    
     - name: Install dependencies
       run: |
-        pip install curl_cffi beautifulsoup4
+        pip install selenium beautifulsoup4
     
     - name: Create cookies.json from secret
       env:
@@ -46,52 +43,42 @@ jobs:
       uses: actions/download-artifact@v4
       continue-on-error: true
       with:
-        name: tag-collection-progress
+        name: tag-progress-selenium
         path: ./
     
-    - name: Show progress
+    - name: Show current progress
       run: |
         if [ -f "collector_progress.json" ]; then
-          PROCESSED=$(jq '.processed_videos | length' collector_progress.json)
-          TOTAL=$(jq '.video_queue | length' collector_progress.json)
+          PROCESSED=$(python -c "import json; d=open('collector_progress.json').read(); print(len(json.loads(d).get('processed_videos', [])))")
+          TOTAL=$(python -c "import json; d=open('collector_progress.json').read(); print(len(json.loads(d).get('video_queue', [])))")
           echo "📊 Progress: $PROCESSED / $TOTAL videos"
           echo "PROCESSED=$PROCESSED" >> $GITHUB_ENV
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-        else
-          echo "⚠ No progress file found"
         fi
     
-    - name: Run collector
+    - name: Run Selenium collector
       env:
-        REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.3' }}
-        SAVE_INTERVAL: ${{ github.event.inputs.save_interval || '50' }}
-        MAX_VIDEOS: ${{ github.event.inputs.max_videos || '0' }}
+        CHROME_BIN: /usr/bin/chromium-browser
+        CHROMEDRIVER_PATH: /usr/bin/chromedriver
       run: |
         echo "Starting at $(date)"
-        python continue.py
-      continue-on-error: true
+        python continue_selenium.py
     
     - name: Upload results
       uses: actions/upload-artifact@v4
       with:
-        name: tag-collection-progress
+        name: tag-progress-selenium
         path: |
           collector_progress.json
           tags_updated.json
           new_tags.txt
-          collection_report.json
         retention-days: 90
     
     - name: Show summary
       if: always()
       run: |
         echo "## Collection Results" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        if [ -f "collection_report.json" ]; then
-          cat collection_report.json >> $GITHUB_STEP_SUMMARY
-        fi
         if [ -f "new_tags.txt" ]; then
           COUNT=$(wc -l < new_tags.txt)
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**New tags found:** $COUNT" >> $GITHUB_STEP_SUMMARY
         fi
